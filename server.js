@@ -19,18 +19,72 @@ app.use(express.json());
 // ==========================================
 // 1. POSTGRES CONNECTION
 // ==========================================
-// Set DATABASE_URL, e.g.:
-// postgres://user:pass@localhost:5432/mandidb   (local/Docker)
-// or the connection string Neon/Supabase gives you.
+// Set DATABASE_URL, POSTGRES_URL, or use default PG env vars
+const dbUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+const poolConfig = {};
+if (dbUrl) {
+  poolConfig.connectionString = dbUrl;
+  if (!dbUrl.includes('localhost')) {
+    poolConfig.ssl = { rejectUnauthorized: false };
+  }
+} else if (process.env.PGHOST) {
+  if (process.env.PGHOST !== 'localhost') {
+    poolConfig.ssl = { rejectUnauthorized: false };
+  }
+}
+
 const { Pool } = pg;
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes('neon.tech') || process.env.DATABASE_URL?.includes('supabase')
-    ? { rejectUnauthorized: false }
-    : false
-});
+const pool = new Pool(poolConfig);
 
 const GOV_PRICE_TTL_MS = 3600000; // 1 hour, same as before
+
+const REQUIRED_SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS mandi_coordinates (
+    id SERIAL PRIMARY KEY,
+    market TEXT NOT NULL,
+    district TEXT NOT NULL,
+    state TEXT NOT NULL,
+    lat DOUBLE PRECISION NOT NULL,
+    lon DOUBLE PRECISION NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (market, district, state)
+  );
+
+  CREATE TABLE IF NOT EXISTS gov_prices (
+    id SERIAL PRIMARY KEY,
+    crop TEXT NOT NULL,
+    state TEXT NOT NULL,
+    data JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (crop, state)
+  );
+
+  CREATE TABLE IF NOT EXISTS distances (
+    id SERIAL PRIMARY KEY,
+    farmer_lat DOUBLE PRECISION NOT NULL,
+    farmer_lon DOUBLE PRECISION NOT NULL,
+    mandi_lat DOUBLE PRECISION NOT NULL,
+    mandi_lon DOUBLE PRECISION NOT NULL,
+    distance_km DOUBLE PRECISION NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (farmer_lat, farmer_lon, mandi_lat, mandi_lon)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_distances_lookup
+    ON distances (farmer_lat, farmer_lon, mandi_lat, mandi_lon);
+`;
+
+let schemaEnsured = false;
+async function ensureSchema() {
+  if (schemaEnsured) return;
+
+  try {
+    await pool.query(REQUIRED_SCHEMA_SQL);
+    schemaEnsured = true;
+  } catch (error) {
+    console.error(`Schema bootstrap failed: ${error.message}`);
+  }
+}
 
 async function fetchMandiApi(path, params = {}) {
   const url = new URL(`${MANDI_API_BASE}/${path}`);
@@ -60,6 +114,8 @@ function calculateHaversine(lat1, lon1, lat2, lon2) {
 
 // Mandi coordinates: check DB first, then Open-Meteo's free geocoder, then save.
 async function getMandiCoordinates(market, district, state) {
+  await ensureSchema();
+
   const existing = await pool.query(
     'SELECT lat, lon FROM mandi_coordinates WHERE market=$1 AND district=$2 AND state=$3',
     [market, district, state]
@@ -93,6 +149,8 @@ async function getMandiCoordinates(market, district, state) {
 
 // Road distance: check cache, then OSRM driving route, then straight-line fallback.
 async function getRoadDistance(fLat, fLon, mLat, mLon) {
+  await ensureSchema();
+
   const roundedFLat = parseFloat(fLat.toFixed(2));
   const roundedFLon = parseFloat(fLon.toFixed(2));
   const roundedMLat = parseFloat(mLat.toFixed(4));
@@ -148,6 +206,8 @@ function normalizeMandiRecords(result, crop) {
 
 // RapidAPI mandi prices: check DB (with 1hr TTL), then the crop endpoint, then save.
 async function fetchLiveMandiPrices(crop, state, { market, variety, date } = {}) {
+  await ensureSchema();
+
   const existing = await pool.query(
     'SELECT data, updated_at FROM gov_prices WHERE crop=$1 AND state=$2',
     [crop, state]
@@ -327,7 +387,9 @@ app.get('/', (req, res) => {
   return fs.readFile(new URL('./public/index.html', import.meta.url), 'utf8')
     .then((html) => res.type('html').send(html))
     .catch(() => res.status(500).send('Frontend file could not be loaded.'));
+});
 
+app.get('/legacy-ui', (req, res) => {
   res.send(`
 <!DOCTYPE html>
 <html lang="en">
